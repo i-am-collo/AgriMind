@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache & databases
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.sqlite3
+agrimind.db
+
+# Build outputs
+dist/
+build/
+.output/
+
+# Logs & temp
+*.log
+.DS_Store
+.env
+.env.local
