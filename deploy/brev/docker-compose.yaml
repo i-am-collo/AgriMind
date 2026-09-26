@@ -1,0 +1,55 @@
+# AgriMind — Brev GPU Launchable: Qwen2-VL-7B-Instruct (vLLM)
+# =============================================================
+# This docker-compose file is the deployment unit for the AgriMind
+# self-hosted VLM inference server on NVIDIA Brev.
+#
+# Model: Qwen/Qwen2-VL-7B-Instruct (vision-language, 7B parameters)
+# Runtime: vLLM OpenAI-compatible server
+# Target GPU: L4 24 GB  |  A10G 24 GB  |  A100 40 GB (fallback)
+#
+# Usage on Brev
+# -------------
+# 1. Log in to brev.nvidia.com and create a new Launchable.
+# 2. Select "I have code files in a GitHub repository".
+# 3. Choose "With container(s)" → "Docker Compose".
+# 4. Point to this file in your repository.
+# 5. Add your HF_TOKEN as a Brev Secret bound to HF_TOKEN.
+# 6. Select GPU: L4 24 GB (preferred) or A10G 24 GB.
+# 7. Launch and note the Brev tunnel URL.
+# 8. Set INFERENCE_ENDPOINT_URL=<tunnel-url> in your AgriMind .env.
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    ipc: host   # Required — vLLM PagedAttention relies on shared memory
+    volumes:
+      # Cache model weights across container restarts to avoid re-downloads
+      - model_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    command: >
+      --model Qwen/Qwen2-VL-7B-Instruct
+      --dtype bfloat16
+      --gpu-memory-utilization 0.90
+      --max-model-len 4096
+      --served-model-name Qwen/Qwen2-VL-7B-Instruct
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s    # Allow 3 min for model weight download & load
+
+volumes:
+  model_cache:
