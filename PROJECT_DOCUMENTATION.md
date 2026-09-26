@@ -7,53 +7,52 @@
 
 **AgriMind** is an enterprise-grade, full-stack agricultural decision-support engine designed for small-to-medium farmers, livestock managers, and agricultural extension officers.
 
-It bridges raw farm telemetry (mortality tracking, feed consumption in kg, water usage in liters) with multimodal vision AI diagnostics using a **self-hosted open-weight VLM (Qwen2-VL-7B-Instruct)** served on an NVIDIA GPU via vLLM. AgriMind delivers non-hallucinated, hyper-local agronomic advice, disease identification, and structured treatment protocols for **Crops**, **Poultry**, and **Livestock**. Google Gemini 2.5 Flash is supported as an optional secondary cloud fallback.
+It bridges raw farm telemetry (mortality tracking, feed consumption in kg, water usage in liters) with multimodal vision AI diagnostics using a **Retrieval-Augmented Generation (RAG)** pipeline powered by Google Gemini (3.5 Flash Lite) and Gemini Embeddings (001). AgriMind delivers non-hallucinated, hyper-local agronomic advice, disease identification, and structured treatment protocols for **Crops**, **Poultry**, and **Livestock**.
 
 ### Key System Capabilities
 - **Multimodal Visual Health Diagnostics:** Instant pathogen identification from photos (crop leaf blights, poultry coccidiosis/bronchitis, bovine mastitis) with confidence meters and severity classification.
-- **Resource & Telemetry Tracking:** Daily mortality logs, feed-to-growth ratios (FCR), and water intake monitoring tied to active production batches.
-- **Strict RAG & Precision Pathology:** Enforces verified agronomic standards, exact chemical proportions, water-mix ratios, safety warnings, and healthy specimen detection (`Low` risk, 95%+ confidence).
-- **Resilient 3-Tier Inference:** Self-hosted VLM → Gemini API (optional) → Keyword fallback engine. Guarantees a meaningful diagnosis 100% of the time.
+- **RAG Knowledge Base:** Cites exact dosages, chemical proportions, and safety warnings strictly retrieved from verified FAO, OIE, and Merck veterinary standards.
+- **Non-Agricultural Image Safeguard:** AI is strictly constrained to reject irrelevant images (cars, people, furniture) returning a safe "Invalid Image" JSON response rather than hallucinating.
+- **Resilient 3-Tier Inference:** Semantic RAG (Embeddings) → Keyword RAG (BM25) → Offline Keyword Fallback. Guarantees a meaningful diagnosis 100% of the time, even without an API key.
 
 ---
-
 
 ## 2. SYSTEM ARCHITECTURE & DATA FLOW
 
 ```mermaid
 graph TD
-    A[Farmer / Extension Worker] -->|Upload Photo & Select Category| B[React 18 SPA - Port 3000]
+    A[Farmer / Extension] -->|Upload Photo| B[React 18 SPA]
     B -->|POST /api/v1/diagnose| C[FastAPI REST Backend]
-    C --> D{Inference Engine}
-    D -->|Primary: HTTPS| E[Self-hosted VLM\nQwen2-VL-7B-Instruct\nvia vLLM / NVIDIA Brev]
-    D -->|Secondary: Cloud API| F[Google Gemini 2.5 Flash\noptional]
-    D -->|Always-available fallback| G[Keyword Expert Engine\nno network required]
-    E -->|Guided JSON - DiagnosticResult| C
-    F -->|Structured JSON| C
-    G -->|DiagnosticResult| C
-    C -->|Persist| H[(PostgreSQL / SQLite)]
-    C -->|JSON Diagnostic Payload| B
-    B -->|Render Treatment Plan & Action Cards| A
+    C --> D{Retrieval Engine (rag_engine.py)}
+    D -->|If API Key| E[Semantic: gemini-embedding-001]
+    D -->|No API Key| F[Keyword: BM25 TF-IDF fallback]
+    E --> G[Knowledge Base: 15 Verified Chunks]
+    F --> G
+    G --> H{Generation Engine (ai_engine.py)}
+    H -->|Prompt Injection| I[Image Validation Layer: Rule 1]
+    I -->|Valid Agri Subject| J[Gemini 3.5 Flash Lite]
+    I -->|Irrelevant Image| K[Reject: Invalid Image JSON]
+    J -->|Guided JSON| L[DiagnosticResult]
+    H -->|If API Key missing/fails| M[Offline Keyword Fallback]
+    M --> L
+    L -->|Persist| N[(PostgreSQL / SQLite)]
+    L --> B
 ```
 
 ### Data Flow Execution Sequence
 
-1. **User Action:** Farmer selects target category (`Poultry`, `Crops`, or `Livestock`), uploads a specimen photo, and optionally adds field-observation notes or links to an active batch.
-2. **API Request:** Frontend issues `POST /api/v1/diagnose` as `multipart/form-data`.
-3. **3-Tier AI Vision Pipeline:**
-   - **Tier 1 — Self-hosted VLM:** `inference_client.VLMInferenceClient` sends the image + structured prompt to the OpenAI-compatible `/v1/chat/completions` endpoint (vLLM serving Qwen2-VL-7B-Instruct on an NVIDIA GPU). Guided JSON generation (`guided_json` / `structured_outputs`) constrains the output to `DiagnosticResult.model_json_schema()`.
-   - **Tier 2 — Gemini 2.5 Flash (optional):** If the VLM endpoint is not configured or raises `InferenceError`, the engine falls back to the `google-genai` SDK (requires `GEMINI_API_KEY`).
-   - **Tier 3 — Keyword Fallback Engine:** If both cloud paths are unavailable (no key, offline, timeout), a context-aware keyword matcher returns a fully populated `DiagnosticResult` immediately — zero latency, zero network.
-4. **Data Persistence & Display:** Findings, severity badges, and structured treatment plans are persisted to the database and rendered dynamically on the React dashboard.
+1. **User Action:** Farmer selects target category (`Poultry`, `Crops`, or `Livestock`), uploads a specimen photo, and optionally adds field-observation notes.
+2. **RAG Retrieval:** `rag_engine.py` retrieves the top 4 most relevant agronomic records from `knowledge_base.py`. Uses semantic cosine-similarity if `GEMINI_API_KEY` is present, else BM25.
+3. **Generation / Image Safeguard:** The retrieved context is injected into Gemini's system prompt. Rule #1 forces the AI to check if the image is actually agricultural. If it's a random object (e.g., a chair), it immediately rejects it.
+4. **Offline Fallback:** If no API key is provided or the network fails, the `generate_expert_fallback_diagnostic` guarantees a fallback response based on the text inputs.
 
 ### Key New Files Introduced
 
 | File | Purpose |
 |---|---|
-| `backend/app/inference_client.py` | Abstract `InferenceClient` interface + `VLMInferenceClient` concrete implementation |
-| `backend/app/config.py` | pydantic-settings `BaseSettings` with `INFERENCE_*` env vars |
-| `deploy/brev/docker-compose.yaml` | vLLM container deployment on NVIDIA Brev GPU |
-| `deploy/brev/README.md` | Step-by-step Brev provisioning guide |
+| `backend/app/knowledge_base.py` | 15 curated, verified agricultural pathology records with FAO/OIE dosages |
+| `backend/app/rag_engine.py` | Dual-strategy retrieval (Semantic embedding vs BM25 keyword) |
+| `backend/app/config.py` | pydantic-settings `BaseSettings` loading from root `.env` |
 | `.env.example` | Documented template for all environment variables |
 
 ---
@@ -104,36 +103,31 @@ CREATE TABLE IF NOT EXISTS diagnostics (
 
 ---
 
-## 4. MULTIMODAL AI ENGINE
+## 4. MULTIMODAL RAG AI ENGINE
 
-The AI subsystem spans two files and implements a resilient 3-tier inference chain.
+The AI subsystem spans three core files and implements a resilient dual-retrieval generation architecture.
 
-### `backend/app/inference_client.py` — Abstraction Layer
+### `backend/app/knowledge_base.py` — The Corpus
+Contains 15 curated, domain-specific agronomic chunks covering healthy baselines, nutrient deficiencies, and major pathogens (e.g., Coccidiosis, Fall Armyworm, Bovine Mastitis). Every record includes strict FAO/OIE citations, precise chemical dosages, and exact treatment schedules.
 
-```
-InferenceClient (ABC)
-└── VLMInferenceClient
-        ├── diagnose_image(image, category, notes) → DiagnosticResult
-        ├── _build_payload()  — constructs OpenAI chat-completions body
-        │                       with guided_json / structured_outputs
-        ├── _post_with_retry() — async httpx POST with configurable retries
-        └── _parse_response()  — extracts + validates JSON into DiagnosticResult
-```
+### `backend/app/rag_engine.py` — Retrieval Layer
+Implements an auto-selecting dual retrieval strategy:
+1. **Semantic (Preferred):** Uses `gemini-embedding-001` to embed the query and the knowledge base, returning the top-K chunks via cosine similarity.
+2. **Keyword (Fallback):** Pure-Python BM25 / TF-IDF scoring based on token overlap. Used if the embedding API fails or no API key is present.
 
-**Key design decisions:**
-- `guided_json` + `extra_body.structured_outputs` are sent simultaneously for maximum vLLM version compatibility (pre-0.6 and post-0.6 APIs).
-- `response_format.json_schema` is also included for NVIDIA NIM compatibility.
-- The schema is pre-built once from `DiagnosticResult.model_json_schema()` at client construction time.
-- Images are transmitted as base64 data-URI inside the `image_url` content block (standard OpenAI vision format).
-
-### `backend/app/ai_engine.py` — Entry Point
+### `backend/app/ai_engine.py` — Generation & Validation Layer
 
 ```python
 def run_ai_diagnosis(image_bytes, batch_type, notes) -> DiagnosticResult:
-    # Tier 1: Self-hosted VLM (if INFERENCE_ENDPOINT_URL is a real remote URL)
-    # Tier 2: Gemini 2.5 Flash (if GEMINI_API_KEY is set)
-    # Tier 3: generate_expert_fallback_diagnostic() — always available
+    # 1. RAG Retrieval (Semantic or BM25)
+    # 2. Image Validation Safeguard (Rule 1: Reject non-agri images)
+    # 3. Gemini 3.5 Flash Lite Generation (grounded in RAG context)
+    # 4. Expert Keyword Fallback (if API key missing or offline)
 ```
+
+**Key design decisions:**
+- **Image Validation Safeguard:** Rule #1 of the Gemini system prompt forces the AI to check if the image contains the expected agricultural category. Irrelevant images (cars, people, furniture) return a safe `Invalid Image` JSON without breaking the UI.
+- **RAG Grounding:** Gemini is strictly instructed to extract dosages and chemical names exclusively from the retrieved context blocks, preventing hallucination.
 
 ### Pydantic Output Schema (unchanged — MUST NOT be modified)
 
@@ -156,15 +150,14 @@ class DiagnosticResult(BaseModel):
 
 ### Configuration Environment Variables
 
+Loaded via `pydantic-settings` from the project root (`.env`).
+
 | Variable | Default | Description |
 |---|---|---|
-| `INFERENCE_ENDPOINT_URL` | `http://localhost:8000` | Base URL of vLLM / NIM server |
-| `INFERENCE_MODEL_NAME` | `Qwen/Qwen2-VL-7B-Instruct` | Model ID as started on the server |
-| `INFERENCE_TIMEOUT_SECONDS` | `120` | Per-request HTTP timeout |
-| `INFERENCE_MAX_RETRIES` | `3` | Retries on transient connectivity errors |
-| `GEMINI_API_KEY` | _(blank)_ | Optional Gemini fallback key |
+| `GEMINI_API_KEY` | _(blank)_ | Required for Gemini 3.5 Flash Lite + Embeddings |
+| `DATABASE_URL` | `sqlite:///./agrimind.db` | PostgreSQL/SQLite connection string |
 
-### Context-Aware Pathologist Fallback Engine
+### Context-Aware Offline Fallback Engine
 
 When operating in keyless or offline modes, `generate_expert_fallback_diagnostic()` inspects field observation keywords (*"yellow leaves"*, *"caterpillar"*, *"coughing"*, *"udder swelling"*, *"healthy check"*) and target categories to return 100% accurate, realistic pathology reports — zero latency, zero network.
 
@@ -245,14 +238,16 @@ Ran 13 tests in 2.21s  OK
 
 ---
 
-### Option A — Local Development (keyword fallback, no GPU required)
+### Option A — Full AI Engine (Gemini + RAG)
 
 #### Step 1: Configure environment
 ```powershell
 # In the project root (c:\Users\Administrator\Desktop\AgriMind)
 Copy-Item .env.example .env
-# Edit .env: leave INFERENCE_ENDPOINT_URL=http://localhost:8000 (default)
-# The engine will skip Tier 1 & 2 and use the expert keyword engine automatically.
+```
+Edit `.env` and add your Gemini API Key:
+```env
+GEMINI_API_KEY=AIzaSy...
 ```
 
 #### Step 2: Install and start the backend
@@ -269,53 +264,26 @@ npm install
 npx vite --port 3000
 ```
 
+When you submit a diagnostic image, the backend logs will show:
+```
+[RAG/semantic] Retrieved 4 chunks via semantic-embedding
+[AI Engine] Gemini+RAG diagnosis: Avian Infectious Bronchitis (93.0%) via semantic-embedding
+```
+
+---
+
+### Option B — Offline Development (Keyword Fallback)
+
+If you don't have an API key or need to test completely offline:
+
+1. Leave `GEMINI_API_KEY` blank or comment it out in `.env`.
+2. Start the backend and frontend as described in Option A.
+3. The engine will skip the Gemini cloud layer, execute BM25 keyword retrieval locally, and instantly return an expert fallback diagnosis.
+
 #### Access points
 | Service | URL |
 |---|---|
 | React Dashboard | http://localhost:3000 |
 | FastAPI Backend | http://127.0.0.1:8001 |
 | Swagger Docs | http://127.0.0.1:8001/docs |
-
----
-
-### Option B — With Self-Hosted VLM on NVIDIA Brev
-
-#### Step 1: Provision the GPU server
-Follow the full guide in [`deploy/brev/README.md`](deploy/brev/README.md).
-At the end you will have a Brev tunnel URL like:
-```
-https://agrimind-vlm-xxxxxxxx.brevlab.com
-```
-
-#### Step 2: Configure the backend to use the VLM
-Edit `.env`:
-```env
-INFERENCE_ENDPOINT_URL=https://agrimind-vlm-xxxxxxxx.brevlab.com
-INFERENCE_MODEL_NAME=Qwen/Qwen2-VL-7B-Instruct
-INFERENCE_TIMEOUT_SECONDS=120
-INFERENCE_MAX_RETRIES=3
-```
-
-#### Step 3: Start backend and frontend (same as Option A Steps 2–3)
-
-When you submit a diagnostic image the backend log will show:
-```
-[AI Engine] VLM diagnosis complete: Fall Armyworm Damage (Spodoptera frugiperda) (96.8%)
-```
-
----
-
-### Option C — With Google Gemini Fallback
-
-Add your Gemini API key to `.env`:
-```env
-GEMINI_API_KEY=AIzaSy...
-```
-Leave `INFERENCE_ENDPOINT_URL` as the default `http://localhost:8000`.
-The engine skips Tier 1 (no remote VLM configured) and uses Gemini directly.
-
-> [!TIP]
-> To re-enable `google-genai`, install it separately:
-> `pip install "google-genai>=0.1.1"`
-> It is not listed in `requirements.txt` by default.
 
