@@ -64,18 +64,25 @@ USER FIELD OBSERVATIONS:
 {notes}
 
 CRITICAL EXECUTION RULES:
-1. STRICT CONTEXT ADHERENCE: Ground every recommendation in the retrieved
+1. IMAGE VALIDATION (CRITICAL): First, verify that the image actually contains the TARGET CATEGORY ({category}). If the image is completely unrelated (e.g., a car, a person, indoor furniture, random objects), you MUST reject it. Return:
+   - detected_issue: "Invalid Image: Non-Agricultural Subject"
+   - severity: "Low"
+   - confidence_score: 100.0
+   - symptom_analysis: ["The uploaded image does not appear to contain {category}."]
+   - immediate_actions: ["Please upload a valid image of the affected specimen."]
+   - Fill all other string array fields with ["N/A"] and resource_adjustments with "N/A".
+2. STRICT CONTEXT ADHERENCE: Ground every recommendation in the retrieved
    records above. If a symptom or treatment is not in the retrieved context,
    clearly state "Based on retrieved agronomic standards:" before any advice.
-2. EXACT DOSAGES: Use the precise chemical dosages, water-mix ratios, and
+3. EXACT DOSAGES: Use the precise chemical dosages, water-mix ratios, and
    application rates specified in the retrieved records. Never fabricate doses.
-3. VISUAL EVIDENCE: Correlate retrieved symptom descriptions with what is
+4. VISUAL EVIDENCE: Correlate retrieved symptom descriptions with what is
    visually visible in the uploaded image.
-4. SAFETY WARNINGS: Include withdrawal periods, PPE requirements, and
+5. SAFETY WARNINGS: Include withdrawal periods, PPE requirements, and
    hazardous material warnings as stated in the records.
-5. HEALTHY DETECTION: If the image and notes indicate a healthy specimen,
+6. HEALTHY DETECTION: If the image and notes indicate a healthy specimen,
    return severity="Low" and confidence_score≥95.0.
-6. OUTPUT FORMAT: Respond ONLY with valid JSON conforming to the
+7. OUTPUT FORMAT: Respond ONLY with valid JSON conforming to the
    DiagnosticResult schema. No markdown, no prose outside the JSON.
 
 DiagnosticResult schema fields (ALL required):
