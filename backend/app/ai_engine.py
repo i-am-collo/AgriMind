@@ -1,34 +1,32 @@
 """
-AgriMind — AI Engine
-~~~~~~~~~~~~~~~~~~~~~
-Entry point for all visual diagnostics requests coming through the FastAPI
-route ``POST /api/v1/diagnose``.
+AgriMind — AI Engine (Gemini + RAG)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Entry point for all visual diagnostics requests from POST /api/v1/diagnose.
 
 Execution order
 ---------------
-1. If ``INFERENCE_ENDPOINT_URL`` is configured and reachable, delegate to
-   :class:`~app.inference_client.VLMInferenceClient` which calls a
-   self-hosted Qwen2-VL-7B-Instruct (or any OpenAI-compatible VLM) and
-   returns a validated :class:`~app.models.DiagnosticResult`.
+1. **RAG Retrieval** — The user's field notes + category are used to
+   retrieve the most relevant verified agronomic knowledge chunks from the
+   local knowledge base (semantic embedding if API key present, else BM25).
 
-2. If the VLM endpoint is not configured (empty URL) or raises
-   :class:`~app.inference_client.InferenceError`, the engine falls through
-   to the legacy Gemini 2.5 Flash path (if ``GEMINI_API_KEY`` is set).
+2. **Gemini 2.5 Flash (primary)** — The retrieved context + the uploaded
+   image are sent to Gemini. The RAG context is injected into the system
+   prompt so Gemini generates grounded, factual, citation-aware advice
+   constrained to the DiagnosticResult schema.
 
-3. If both cloud paths are unavailable, the context-aware keyword-matched
-   fallback engine is used — guaranteeing a meaningful response 100% of the
-   time even in fully offline / API-free environments.
+3. **Expert Keyword Fallback (safety net)** — If Gemini is unavailable
+   (no API key, quota exceeded, network error), the context-aware keyword
+   engine returns a clinically meaningful result with zero latency.
 
-Contracts that must never change
----------------------------------
+Contracts that must not change
+-------------------------------
 * Function signature: ``run_ai_diagnosis(image_bytes, batch_type, notes)``
 * Return type: ``DiagnosticResult``
-* The ``generate_expert_fallback_diagnostic`` function is public and tested.
+* ``generate_expert_fallback_diagnostic`` is public and tested.
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 import logging
@@ -37,10 +35,60 @@ import os
 from PIL import Image
 
 from app.config import settings
-from app.inference_client import InferenceError, VLMInferenceClient
 from app.models import DiagnosticResult, ResourceAdjustments
+from app.rag_engine import retrieve
 
 logger = logging.getLogger("agrimind.ai_engine")
+
+
+# ---------------------------------------------------------------------------
+# RAG-augmented system prompt template
+# ---------------------------------------------------------------------------
+
+_RAG_SYSTEM_PROMPT = """\
+You are AgriMind AI, the AI-Powered Smart Agricultural Resource Engine.
+Your mission: provide accurate, reliable, hyper-local agronomic diagnostics
+to farmers and extension workers.
+
+TARGET CATEGORY: {category}
+
+===== RETRIEVED AGRONOMIC CONTEXT (RAG) =====
+The following records have been retrieved from a verified agronomic knowledge
+base and are DIRECTLY RELEVANT to this diagnostic request. You MUST base
+your diagnosis, treatment protocols, and dosages on these records.
+
+{retrieved_context}
+===== END OF RETRIEVED CONTEXT =====
+
+USER FIELD OBSERVATIONS:
+{notes}
+
+CRITICAL EXECUTION RULES:
+1. STRICT CONTEXT ADHERENCE: Ground every recommendation in the retrieved
+   records above. If a symptom or treatment is not in the retrieved context,
+   clearly state "Based on retrieved agronomic standards:" before any advice.
+2. EXACT DOSAGES: Use the precise chemical dosages, water-mix ratios, and
+   application rates specified in the retrieved records. Never fabricate doses.
+3. VISUAL EVIDENCE: Correlate retrieved symptom descriptions with what is
+   visually visible in the uploaded image.
+4. SAFETY WARNINGS: Include withdrawal periods, PPE requirements, and
+   hazardous material warnings as stated in the records.
+5. HEALTHY DETECTION: If the image and notes indicate a healthy specimen,
+   return severity="Low" and confidence_score≥95.0.
+6. OUTPUT FORMAT: Respond ONLY with valid JSON conforming to the
+   DiagnosticResult schema. No markdown, no prose outside the JSON.
+
+DiagnosticResult schema fields (ALL required):
+- detected_issue: string
+- severity: "Low" | "Medium" | "High" | "Critical"
+- confidence_score: float (0.0–100.0)
+- symptom_analysis: array of strings (visual symptoms observed)
+- immediate_actions: array of strings
+- medication_or_inputs: array of strings (with exact dosages from context)
+- preventative_measures: array of strings
+- isolation_required: boolean
+- resource_adjustments: object with feed_recommendation and water_recommendation
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -53,117 +101,94 @@ def run_ai_diagnosis(
     notes: str = "",
 ) -> DiagnosticResult:
     """
-    Executes multimodal AI visual diagnosis on an agricultural image.
+    Executes RAG-augmented multimodal AI diagnosis on an agricultural image.
 
-    Tries three inference paths in order of preference:
-    1. Self-hosted VLM (Qwen2-VL / vLLM / NIM) — primary engine
-    2. Gemini 2.5 Flash via google-genai SDK — optional cloud fallback
-    3. Expert keyword-matched fallback engine — always-available safety net
+    1. Retrieves relevant agronomic context (semantic or keyword BM25).
+    2. Sends image + retrieved context to Gemini 2.5 Flash.
+    3. Falls back to keyword expert engine if Gemini is unavailable.
     """
-    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    # ------------------------------------------------------------------
-    # Path 1: Self-hosted VLM endpoint
-    # ------------------------------------------------------------------
-    endpoint = (settings.INFERENCE_ENDPOINT_URL or "").strip()
-    if endpoint and endpoint not in ("http://localhost:8000", ""):
-        # Only attempt if the operator has configured a real remote endpoint
-        try:
-            client = VLMInferenceClient()
-            result = asyncio.run(
-                client.diagnose_image(pil_image, batch_type, notes)
-            )
-            logger.info(
-                "[AI Engine] VLM diagnosis complete: %s (%.1f%%)",
-                result.detected_issue,
-                result.confidence_score,
-            )
-            return result
-        except InferenceError as exc:
-            logger.warning(
-                "[AI Engine] VLM endpoint failed — falling back. Reason: %s", exc
-            )
-        except Exception as exc:  # noqa: BLE001 — catch-all for asyncio edge cases
-            logger.warning(
-                "[AI Engine] Unexpected VLM error — falling back. Reason: %s", exc
-            )
-
-    # ------------------------------------------------------------------
-    # Path 2: Gemini 2.5 Flash (legacy cloud path)
-    # ------------------------------------------------------------------
     api_key = (settings.GEMINI_API_KEY or "").strip() or os.environ.get(
         "GEMINI_API_KEY", ""
     )
+
+    # ------------------------------------------------------------------
+    # Step 1: RAG Retrieval — always runs (keyword if no API key)
+    # ------------------------------------------------------------------
+    query = notes if notes else f"Routine visual health inspection of {batch_type}"
+    retrieved = retrieve(
+        query=query,
+        category=batch_type,
+        api_key=api_key or None,
+        top_k=4,
+        prefer_semantic=bool(api_key),
+    )
+    logger.info(
+        "[AI Engine] RAG retrieved %d chunks via %s",
+        len(retrieved.chunks),
+        retrieved.strategy_used,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: Gemini 2.5 Flash generation with RAG context
+    # ------------------------------------------------------------------
     if api_key:
         try:
             from google import genai  # type: ignore[import-untyped]
             from google.genai import types  # type: ignore[import-untyped]
 
-            client_g = genai.Client(api_key=api_key)
+            pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            client = genai.Client(api_key=api_key)
 
-            system_instruction = f"""
-            You are AgriMind AI, the AI-Powered Smart Agricultural Resource Engine.
-            Your primary mission is to provide accurate, reliable, and hyper-local
-            agronomic advice, visual pathology diagnostics, and decision support to
-            farmers and extension workers.
+            system_instruction = _RAG_SYSTEM_PROMPT.format(
+                category=batch_type,
+                retrieved_context=retrieved.format_for_prompt(),
+                notes=notes if notes else "Routine visual health inspection",
+            )
 
-            TARGET CATEGORY: {batch_type}
+            user_message = (
+                f"Please perform a comprehensive visual health diagnosis on this "
+                f"{batch_type} image.\n\n"
+                f"Field observations: {notes if notes else 'Routine visual health inspection'}\n\n"
+                f"Use the retrieved agronomic context provided in your system instructions "
+                f"to ground your diagnosis and return the DiagnosticResult JSON."
+            )
 
-            CRITICAL EXECUTION RULES:
-            1. STRICT ADHERENCE TO CONTEXT & VISUAL EVIDENCE: Rely strictly on visual
-               evidence and verified agronomic standards. Do not fabricate chemical
-               dosages or treatment steps.
-            2. HYPER-LOCAL LOCALIZATION: Synthesize user observations (notes, telemetry)
-               with visual findings. Tailor advice to the microclimate, soil type, and
-               regional constraints.
-            3. SAFETY & DOSAGE PRECISION: Specify exact proportions, water-mix ratios,
-               and safety precautions. Include clear warnings for hazardous materials.
-            4. CITATION & TRUST: Reference FAO Manuals or State Extension Guides where
-               applicable.
-            5. ACCESSIBLE LANGUAGE: Clear, mobile-friendly bullet points.
-
-            Strictly format the response as valid JSON matching the DiagnosticResult
-            schema.
-            """
-
-            response = client_g.models.generate_content(
+            response = client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=[
-                    pil_image,
-                    (
-                        f"Target Category: {batch_type}\n"
-                        f"Field Observations & User Notes: "
-                        f"{notes if notes else 'Routine visual health inspection'}"
-                    ),
-                ],
+                contents=[pil_image, user_message],
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     response_mime_type="application/json",
                     response_schema=DiagnosticResult,
-                    temperature=0.1,
+                    temperature=0.05,
                 ),
             )
 
             if response and response.text:
-                result_json = json.loads(response.text)
-                logger.info("[AI Engine] Gemini diagnosis complete.")
-                return DiagnosticResult(**result_json)
+                result_data = json.loads(response.text)
+                result = DiagnosticResult(**result_data)
+                logger.info(
+                    "[AI Engine] Gemini+RAG diagnosis: %s (%.1f%%) via %s",
+                    result.detected_issue,
+                    result.confidence_score,
+                    retrieved.strategy_used,
+                )
+                return result
 
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[AI Engine] Gemini API call failed — using fallback. Reason: %s",
-                exc,
+                "[AI Engine] Gemini call failed — using expert fallback. Reason: %s", exc
             )
 
     # ------------------------------------------------------------------
-    # Path 3: Context-aware keyword-matched fallback (always available)
+    # Step 3: Expert keyword fallback (always available, zero latency)
     # ------------------------------------------------------------------
-    logger.info("[AI Engine] Using expert fallback engine.")
+    logger.info("[AI Engine] Using expert fallback engine (no Gemini API key or error).")
     return generate_expert_fallback_diagnostic(batch_type, notes)
 
 
 # ---------------------------------------------------------------------------
-# Fallback engine (keyword-based pathologist — MUST be preserved)
+# Expert keyword fallback engine (MUST be preserved — tested)
 # ---------------------------------------------------------------------------
 
 def generate_expert_fallback_diagnostic(
@@ -173,25 +198,21 @@ def generate_expert_fallback_diagnostic(
     Returns highly accurate, context-aware expert diagnostic reports matching
     field notes and batch category.
 
-    This function is the safety-net of last resort and must never be removed.
-    It is also directly tested by ``backend/test_accuracy.py``.
+    This is the safety-net of last resort. It is directly tested by
+    backend/test_accuracy.py and must never be removed.
     """
     notes_lower = notes.lower()
     batch_type_lower = batch_type.lower()
 
     # -----------------------------------------------------------------------
-    # CROPS DIAGNOSTICS CATALOG
+    # CROPS
     # -----------------------------------------------------------------------
     if (
         "crop" in batch_type_lower
         or "plant" in batch_type_lower
         or "maize" in batch_type_lower
     ):
-        if (
-            "healthy" in notes_lower
-            or "normal" in notes_lower
-            or "good" in notes_lower
-        ):
+        if "healthy" in notes_lower or "normal" in notes_lower or "good" in notes_lower:
             return DiagnosticResult(
                 detected_issue="Healthy Crop Specimen (No Pathogen Detected)",
                 severity="Low",
@@ -201,28 +222,16 @@ def generate_expert_fallback_diagnostic(
                     "Unimpaired vascular leaf structure",
                     "Clean canopy surface without lesions or pest frass",
                 ],
-                immediate_actions=[
-                    "Maintain current irrigation and soil nutrient management schedule."
-                ],
-                medication_or_inputs=[
-                    "Apply routine prophylactic organic neem emulsion spray if pest pressure rises."
-                ],
-                preventative_measures=[
-                    "Perform weekly field monitoring",
-                    "Ensure balanced soil moisture",
-                ],
+                immediate_actions=["Maintain current irrigation and soil nutrient management schedule."],
+                medication_or_inputs=["Apply routine prophylactic organic neem emulsion spray if pest pressure rises."],
+                preventative_measures=["Perform weekly field monitoring", "Ensure balanced soil moisture"],
                 isolation_required=False,
                 resource_adjustments=ResourceAdjustments(
                     feed_recommendation="Maintain standard NPK fertilization schedule according to growth stage.",
                     water_recommendation="Continue standard drip/sprinkler irrigation cycle.",
                 ),
             )
-        elif (
-            "nitrogen" in notes_lower
-            or "yellow" in notes_lower
-            or "pale" in notes_lower
-            or "chlorosis" in notes_lower
-        ):
+        elif "nitrogen" in notes_lower or "yellow" in notes_lower or "pale" in notes_lower or "chlorosis" in notes_lower:
             return DiagnosticResult(
                 detected_issue="Nitrogen (N) Deficiency - Interveinal Chlorosis",
                 severity="Medium",
@@ -237,12 +246,12 @@ def generate_expert_fallback_diagnostic(
                     "Check soil pH to ensure optimal N absorption range (6.0-6.8).",
                 ],
                 medication_or_inputs=[
-                    "Apply Calcium Ammonium Nitrate (CAN) or Urea 46% N foliar spray at 5 kg/ha.",
-                    "Incorporate organic compost or humic acid around root zones.",
+                    "Apply Calcium Ammonium Nitrate (CAN 27% N) or Urea 46% N foliar spray at 5 kg/ha.",
+                    "Incorporate organic compost or humic acid at 2 L/ha around root zones.",
                 ],
                 preventative_measures=[
-                    "Conduct split nitrogen application across crop vegetative stages.",
-                    "Practice leguminous cover crop rotation.",
+                    "Conduct split nitrogen application across crop vegetative stages (V4, V8, VT).",
+                    "Practice leguminous cover crop rotation (soybean, cowpea).",
                 ],
                 isolation_required=False,
                 resource_adjustments=ResourceAdjustments(
@@ -250,12 +259,7 @@ def generate_expert_fallback_diagnostic(
                     water_recommendation="Provide moderate irrigation after nitrogen application to facilitate root uptake without leaching.",
                 ),
             )
-        elif (
-            "worm" in notes_lower
-            or "hole" in notes_lower
-            or "caterpillar" in notes_lower
-            or "eating" in notes_lower
-        ):
+        elif "worm" in notes_lower or "hole" in notes_lower or "caterpillar" in notes_lower or "eating" in notes_lower:
             return DiagnosticResult(
                 detected_issue="Fall Armyworm Damage (Spodoptera frugiperda)",
                 severity="High",
@@ -270,7 +274,8 @@ def generate_expert_fallback_diagnostic(
                     "Apply targeted bio-insecticide directly into plant whorls.",
                 ],
                 medication_or_inputs=[
-                    "Foliar application of Emamectin Benzoate 5% SG at 200 g/ha or Bacillus thuringiensis (Bt).",
+                    "Bacillus thuringiensis (Bt) var. kurstaki at 1 kg/ha applied into the whorl (early instars).",
+                    "Emamectin Benzoate 5% SG at 200 g/ha for larger larvae.",
                     "Install 4-6 pheromone trapping stations per hectare.",
                 ],
                 preventative_measures=[
@@ -283,7 +288,7 @@ def generate_expert_fallback_diagnostic(
                     water_recommendation="Maintain consistent soil moisture levels to minimize crop physiological stress.",
                 ),
             )
-        else:  # Fungal Blight default
+        else:
             return DiagnosticResult(
                 detected_issue="Northern Corn Leaf Blight (Exserohilum turcicum)",
                 severity="Medium",
@@ -298,12 +303,12 @@ def generate_expert_fallback_diagnostic(
                     "Switch from overhead sprinklers to drip irrigation to keep canopy dry.",
                 ],
                 medication_or_inputs=[
-                    "Apply Azoxystrobin + Propiconazole fungicide spray at 0.5 L/ha.",
-                    "Apply foliar micronutrient spray containing Zinc and Manganese.",
+                    "Apply Azoxystrobin (250 g/L) + Propiconazole (250 g/L) at 0.5 L/ha at VT-R1 growth stage.",
+                    "Apply foliar micronutrient spray: Zinc 0.5% + Manganese 0.3%.",
                 ],
                 preventative_measures=[
                     "Rotate fields with non-host legume crops next season.",
-                    "Plant certified resistant hybrid seeds.",
+                    "Plant certified NCLB-resistant hybrid seeds.",
                 ],
                 isolation_required=False,
                 resource_adjustments=ResourceAdjustments(
@@ -313,7 +318,7 @@ def generate_expert_fallback_diagnostic(
             )
 
     # -----------------------------------------------------------------------
-    # LIVESTOCK DIAGNOSTICS CATALOG
+    # LIVESTOCK
     # -----------------------------------------------------------------------
     elif (
         "livestock" in batch_type_lower
@@ -327,47 +332,45 @@ def generate_expert_fallback_diagnostic(
                 severity="Low",
                 confidence_score=99.0,
                 symptom_analysis=[
-                    "Normal skin coat luster and body condition score",
+                    "Normal skin coat luster and body condition score (BCS 3.0-3.5)",
                     "Alert posture and clear eyes",
-                    "Symmetrical udder without heat or swelling",
+                    "Symmetrical udder without heat or swelling — CMT negative",
                 ],
-                immediate_actions=[
-                    "Maintain daily feeding and milking hygiene routines."
-                ],
-                medication_or_inputs=[
-                    "Provide standard mineral lick blocks and clean drinking water."
-                ],
+                immediate_actions=["Maintain daily feeding and milking hygiene routines."],
+                medication_or_inputs=["Provide standard mineral lick blocks and clean drinking water (min 80-100 L/head/day)."],
                 preventative_measures=[
-                    "Routine deworming schedule every 3 months",
+                    "Routine deworming every 3 months (Albendazole 10% at 7.5 mg/kg body weight)",
                     "Maintain dry, ventilated barn bedding",
                 ],
                 isolation_required=False,
                 resource_adjustments=ResourceAdjustments(
-                    feed_recommendation="Maintain standard high-fiber forage ration and dairy concentrate feed.",
+                    feed_recommendation="Maintain standard TMR (Total Mixed Ration) appropriate to production stage.",
                     water_recommendation="Provide continuous access to fresh, cool drinking water (min 80-100 L/head/day).",
                 ),
             )
-        else:  # Mastitis / Udder Issue default
+        else:
             return DiagnosticResult(
                 detected_issue="Bovine Mastitis (Acute Bacterial Infection)",
                 severity="High",
                 confidence_score=94.5,
                 symptom_analysis=[
-                    "Localized udder swelling, redness, and heat",
-                    "Clots, flakes, and watery consistency in foremilk sample",
-                    "Mild fever, appetite loss, and reduced milk yield",
+                    "Localized udder swelling, redness, and heat on affected quarters",
+                    "Clots, flakes, and watery consistency in foremilk — CMT positive",
+                    "Mild fever (39.5-41°C), appetite loss, and reduced milk yield",
                 ],
                 immediate_actions=[
                     "Isolate cow to designated hospital/sanitization stall.",
-                    "Perform California Mastitis Test (CMT) to isolate affected quarters.",
+                    "Perform California Mastitis Test (CMT) to confirm and isolate affected quarters.",
                 ],
                 medication_or_inputs=[
-                    "Administer intramammary antibiotic infusion (Cephapirin sodium) post-milking.",
-                    "Apply anti-inflammatory ointment to udder quarters.",
+                    "Intramammary: Cephapirin sodium 200 mg infused post-milking for 3-5 days.",
+                    "Systemic (if fever): Penicillin G 22,000 IU/kg IM twice daily.",
+                    "NSAID: Flunixin meglumine 2.2 mg/kg IV for pain and inflammation.",
                 ],
                 preventative_measures=[
-                    "Dip teats in 1% iodine solution immediately before and after milking.",
+                    "Pre- and post-milking teat dipping in 1% iodine solution.",
                     "Replace wet bedding straw daily with dry kiln-dried shavings.",
+                    "Dry cow intramammary antibiotic therapy at drying-off.",
                 ],
                 isolation_required=True,
                 resource_adjustments=ResourceAdjustments(
@@ -377,7 +380,7 @@ def generate_expert_fallback_diagnostic(
             )
 
     # -----------------------------------------------------------------------
-    # POULTRY DIAGNOSTICS CATALOG (default)
+    # POULTRY (default)
     # -----------------------------------------------------------------------
     else:
         if "healthy" in notes_lower or "normal" in notes_lower:
@@ -390,12 +393,8 @@ def generate_expert_fallback_diagnostic(
                     "Smooth, full plumage alignment",
                     "Active foraging, bright eyes, and firm droppings",
                 ],
-                immediate_actions=[
-                    "Continue standard flock management and biosecurity protocols."
-                ],
-                medication_or_inputs=[
-                    "Provide standard grower/finisher mash feed and multi-vitamin water supplement."
-                ],
+                immediate_actions=["Continue standard flock management and biosecurity protocols."],
+                medication_or_inputs=["Provide standard grower/finisher mash feed and multi-vitamin water supplement once weekly."],
                 preventative_measures=[
                     "Maintain clean foot-baths at coop entrances",
                     "Ensure coop litter moisture stays under 20%",
@@ -406,13 +405,7 @@ def generate_expert_fallback_diagnostic(
                     water_recommendation="Ensure clean water delivery through nipple drinkers.",
                 ),
             )
-        elif (
-            "cough" in notes_lower
-            or "gasp" in notes_lower
-            or "sneez" in notes_lower
-            or "breathing" in notes_lower
-            or "throat" in notes_lower
-        ):
+        elif "cough" in notes_lower or "gasp" in notes_lower or "sneez" in notes_lower or "breathing" in notes_lower or "throat" in notes_lower:
             return DiagnosticResult(
                 detected_issue="Avian Infectious Bronchitis (IBV Respiratory Strain)",
                 severity="Critical",
@@ -425,14 +418,14 @@ def generate_expert_fallback_diagnostic(
                 immediate_actions=[
                     "Quarantine affected house section immediately; restrict unauthorized farm access.",
                     "Increase coop ambient temperature by 2-3°C to alleviate thermal stress.",
-                    "Fog coop air with non-irritating aerosol disinfectant mist.",
                 ],
                 medication_or_inputs=[
-                    "Administer water-soluble antibiotic (Tylosin or Oxytetracycline) for 5-7 days to prevent secondary bacterial mycoplasma infection.",
-                    "Provide water-soluble multi-vitamins and electrolytes.",
+                    "Tylosin tartrate 500 mg/L in drinking water for 5 days (prevents secondary Mycoplasma infection).",
+                    "Alternative: Oxytetracycline 200 mg/L water for 5 days.",
+                    "Provide water-soluble multivitamins + electrolytes.",
                 ],
                 preventative_measures=[
-                    "Revaccinate healthy flock pens with IB H120 live vaccine.",
+                    "Revaccinate healthy flock pens with IB H120 live vaccine (intranasal or drinking water).",
                     "Enforce strict foot-bath and vehicle spray biosecurity.",
                 ],
                 isolation_required=True,
@@ -441,7 +434,7 @@ def generate_expert_fallback_diagnostic(
                     water_recommendation="Increase water drinker points by 25% and administer anti-stress electrolyte solution.",
                 ),
             )
-        else:  # Default: Coccidiosis / Parasitic
+        else:
             return DiagnosticResult(
                 detected_issue="Coccidiosis (Eimeria tenella Cecal Infection)",
                 severity="High",
@@ -456,12 +449,13 @@ def generate_expert_fallback_diagnostic(
                     "Remove and replace wet, packed litter near feeder and waterer zones.",
                 ],
                 medication_or_inputs=[
-                    "Administer Amprolium 9.6% solution via drinking water for 5 consecutive days (10 ml/gallon).",
-                    "Provide Vitamin K3 supplement to arrest cecal mucosal hemorrhaging.",
+                    "Amprolium 9.6% solution: 28 mL per 4 litres drinking water for 5-7 days.",
+                    "Vitamin K3 (menadione) at 2 mg/L water to control cecal hemorrhage.",
+                    "Vitamin A supplementation to support intestinal mucosa recovery.",
                 ],
                 preventative_measures=[
                     "Maintain litter moisture strictly below 22% with dry pine shavings.",
-                    "Implement anticoccidial shuttle rotation program in feeds.",
+                    "Implement anticoccidial shuttle rotation program in feeds (Salinomycin → Narasin).",
                 ],
                 isolation_required=True,
                 resource_adjustments=ResourceAdjustments(

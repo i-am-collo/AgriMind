@@ -144,37 +144,24 @@ class TestVLMInferenceClientFallback(unittest.IsolatedAsyncioTestCase):
 
     def test_endpoint_failure_falls_back_to_keyword_engine(self) -> None:
         """
-        When run_ai_diagnosis cannot reach the VLM endpoint it must produce
-        a valid DiagnosticResult via the keyword fallback — never raise.
+        When GEMINI_API_KEY is absent, run_ai_diagnosis must produce a valid
+        DiagnosticResult via the keyword fallback engine — never raise.
         """
         import app.ai_engine as engine_module
         from app.models import DiagnosticResult
 
-        # Simulate: endpoint configured but unreachable
+        # Simulate: no Gemini API key configured
         with patch("app.ai_engine.settings") as mock_settings:
-            mock_settings.INFERENCE_ENDPOINT_URL = "http://10.0.0.99:8000"  # fake
             mock_settings.GEMINI_API_KEY = ""
-            mock_settings.INFERENCE_MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
-            mock_settings.INFERENCE_TIMEOUT_SECONDS = 5
-            mock_settings.INFERENCE_MAX_RETRIES = 1
 
-            # Make VLMInferenceClient.diagnose_image raise InferenceError
-            with patch(
-                "app.ai_engine.VLMInferenceClient",
-                side_effect=lambda: MagicMock(
-                    diagnose_image=AsyncMock(
-                        side_effect=Exception("endpoint unreachable")
-                    )
-                ),
-            ):
-                img_bytes = BytesIO()
-                from PIL import Image
-                Image.new("RGB", (4, 4)).save(img_bytes, format="JPEG")
-                img_bytes = img_bytes.getvalue()
+            img_bytes = BytesIO()
+            from PIL import Image
+            Image.new("RGB", (4, 4)).save(img_bytes, format="JPEG")
+            img_bytes = img_bytes.getvalue()
 
-                result = engine_module.run_ai_diagnosis(
-                    img_bytes, "Poultry", "coughing and gasping birds"
-                )
+            result = engine_module.run_ai_diagnosis(
+                img_bytes, "Poultry", "coughing and gasping birds"
+            )
 
         self.assertIsInstance(result, DiagnosticResult)
         self.assertIn("Bronchitis", result.detected_issue)
