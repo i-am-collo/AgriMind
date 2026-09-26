@@ -199,7 +199,7 @@ def _embed_texts(texts: list[str], api_key: str) -> list[list[float]]:
     embeddings = []
     for text in texts:
         result = client.models.embed_content(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=text,
         )
         embeddings.append(result.embeddings[0].values)
